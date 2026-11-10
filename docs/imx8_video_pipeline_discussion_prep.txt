@@ -1,0 +1,299 @@
+i.MX8 Video Pipeline — Discussion Prep
+Updated 25 Oct 2026 · Gagik Hakobyan
+
+HOW TO USE THIS DOC
+Each topic has the same four parts:
+- What we have: requirements and assumptions already on the table.
+- To clarify: questions to ask the client or hardware team.
+- Accept: approaches we can commit to now, or once a stated condition holds.
+- Reject: approaches we should push back on, with the reason.
+
+
+STATUS AFTER Q&A
+The board is the i.MX 8M Plus; the main unknowns now are the sensor type and the first raw data.
+
+Settled
+- SoC: i.MX 8M Plus. NPU (2.3 TOPS, int8) for AI; GPU (OpenVX/OpenCL) for real-time CV; VPU for encoding only. Development can use equivalent 8M Plus boards.
+- Priorities: 1 turbulence, 2 stabilization, 3 lens focus, 4 HDR/AGC. Super-resolution, quality measurement and multispectral are deprioritized.
+- Image size: sensor matrix 640x512; full frame zoomed x2 to 1280x1024. Same 5:4 aspect, integer x2, so a classical upscale is enough.
+- Video input: raw ADC, per the manufacturer's doc. We own the whole image pipeline (correction, AGC); the i.MX ISP is likely unused.
+- Camera mounting: no gimbal at this moment; one may be added later. Stabilization removes mount vibration now; the design stays open to a gimbal.
+- Focus: no net in front of the camera. Scene-based contrast autofocus.
+- End-to-end latency: under 50 ms (about 2.5 frames at 50 fps). No future-frame smoothing; temporal methods use past frames only; all stages pipelined with zero-copy buffers.
+- Data: manufacturer's doc and lots of training data from the client. AI for turbulence becomes realistic; data must be raw, full bit depth, with metadata.
+
+Still open, by impact
+- Sensor type (thermal or visible), bit depth and actual frame rate.
+- Mount type (fixed mast or vehicle) and vibration level; any intentional camera motion?
+- Is a slower (about 1 fps) enhanced turbulence output acceptable next to the 50 fps live view?
+- When the manufacturer's doc and first raw data arrive.
+- Scene content: moving targets, static, low texture.
+- Power and thermal limits.
+
+
+NEXT WEEK (FROM 26 OCT 2026)
+1. Hardware confirmation: sensor type (thermal or visible), bit depth, frame rate, interface; dev board access. Depends on: client.
+2. Manufacturer doc review: raw ADC format and packing, NUC / bad-pixel procedure, lens and focus motor protocol, temperature readout. Depends on: manufacturer doc.
+3. Data request to client: raw full bit depth, per-frame metadata (timestamp, focus position, zoom, temperature), continuous sequences, scenario list. Depends on: item 1.
+4. Turbulence data plan: request paired recordings (same static scene, calm vs hot air); choose a synthetic turbulence simulator for training pairs. Depends on: item 3.
+5. Turbulence baseline (P1): offline prototype of causal temporal fusion with motion mask; agree on a quality metric. Depends on: first data.
+6. Live vs enhanced output: agree whether a slower (about 1 fps) enhanced stream is acceptable next to the 50 fps live view. Depends on: client.
+7. Stabilization scope (P2): mount type, vibration amplitude and frequency, any intentional camera motion. Depends on: client.
+8. Stabilization feasibility: keypoint count and RANSAC inlier statistics on sample frames; phase correlation as fallback. Depends on: first data.
+9. Focus without net (P3): contrast autofocus plan; motor protocol from the doc. Depends on: item 2.
+10. AGC / HDR (P4): raw-to-8-bit mapping baseline once the format is known. Depends on: item 2.
+11. Board bring-up: BSP version; check OpenVX and NPU delegate in the image; first GPU timing of pyramid + optical flow + warp at 640x512. Depends on: dev board.
+
+Blockers to chase first: items 1, 2 and 3. Most technical work starts only once the manufacturer doc and the first raw data arrive.
+
+
+PLATFORM
+The board is the i.MX 8M Plus, so the NPU (2.3 TOPS) is available for AI alongside the GPU for real-time classical CV.
+
+What each block can do
+- VPU (Video Processing Unit): H.264/H.265/VP8/VP9 decode, H.264/H.265 encode. Cannot do any vision processing (keypoints, optical flow, warp).
+- GPU (Vivante GC7000UL): OpenVX, OpenCL, OpenGL ES: pyramids, optical flow, corners, warp, per-pixel correction. Not efficient for large neural networks.
+- NPU (2.3 TOPS): int8 neural networks via TFLite / VX delegate. Not for classical CV; some ops fall back to CPU.
+- ISP (dual): demosaic, HDR merge, AE/AGC, denoise for Bayer sensors. Likely unused with raw ADC input.
+- CPU (4x Cortex-A53): control logic, homography, small matrix math, focus motor control. Not for per-pixel work at 50 fps.
+
+To clarify
+- Answered: board chosen (i.MX 8M Plus); development can use equivalent 8M Plus boards (NXP EVK or a SoM dev kit) as long as the BSP matches the target.
+- Answered: raw ADC output per the manufacturer's doc.
+- Sensor model and type (thermal or visible), interface, bit depth and max frame rate.
+- Output path: HDMI display, encoded stream (VPU), or both?
+- BSP / Linux version, and are OpenVX and the NPU delegate in the image?
+
+Accept
+- VPU only for final encoding of the 1280x1024 output.
+- GPU (OpenVX/OpenCL) for per-pixel classical CV.
+- NPU for AI models, mainly a slower enhanced turbulence output.
+
+Reject
+- Running keypoints, matching or stabilization on the VPU: the hardware does not support it.
+
+
+RAW ADC TO IMAGE (FIRST STAGE)
+Every other topic starts from this stage: the sensor delivers raw ADC values, and we must turn them into a clean, linear image before stabilization, turbulence correction, focus or AGC can work.
+
+What we have
+- Raw ADC output from a 640x512 matrix; conversion to follow the manufacturer's doc.
+- The i.MX ISP is likely unused, so this stage is our own code.
+
+Likely steps (exact list depends on the sensor and the manufacturer's doc)
+1. Unpack: bit depth, packing (for example 14-bit in 16-bit words), byte order, any header or telemetry lines in the frame.
+2. Offset / black level: subtract the dark level.
+3. Non-uniformity correction (NUC): per-pixel gain and offset from the manufacturer's calibration tables; for a thermal sensor, periodic flat-field correction (shutter).
+4. Bad-pixel replacement: from the manufacturer's map, plus detection of pixels that fail later.
+5. Colour pipeline, only if the sensor is visible Bayer: demosaic, white balance, colour correction. In that case the i.MX ISP may do it if the data arrives over MIPI CSI-2.
+6. Light denoise (optional): only if the noise hurts stabilization or focus.
+7. Hand-off: keep 16-bit linear data for stabilization, turbulence and focus; AGC converts to 8-bit at the end.
+
+To clarify
+- Sensor type (thermal or visible) and bit depth.
+- Raw format: packing, byte order, header or telemetry lines.
+- Interface: MIPI CSI-2, parallel, USB, Ethernet?
+- What calibration data the manufacturer provides: NUC tables, bad-pixel map, per-unit or generic.
+- Is there a shutter or other flat-field mechanism, and who triggers it?
+- Per-frame telemetry: sensor temperature, frame counter, timestamps.
+
+Accept
+- Follow the manufacturer's correction procedure first, then improve only where needed.
+- Run the per-pixel steps on the GPU (OpenCL) with zero-copy buffers.
+- Keep linear 16-bit data until the final AGC stage.
+
+Reject
+- Converting to 8-bit early: it throws away the detail that turbulence correction, focus and AGC need.
+- Building our own NUC calibration before trying the manufacturer's tables.
+
+
+1. HOT-AIR DISTORTION (ATMOSPHERIC TURBULENCE)
+This is the highest-risk item: classical methods exist and are cheap for static scenes, but moving objects and the 50 ms latency target make it hard on either path.
+
+What we have
+- Assumption that only AI can solve it. That is not quite right: classical methods exist.
+- Reference model: Turb-Seg-Res (segment moving objects, then restore). Too heavy even on an NVIDIA 3070 laptop GPU.
+- Lots of training data expected from the client.
+
+Known classical approaches
+- Register frames with dense optical flow, then temporal mean or median over past frames. Cheap, works well on static scenes.
+- Lucky imaging / lucky region fusion: keep the sharpest regions across a window of past frames.
+- Non-rigid registration followed by blind deconvolution (Zhu and Milanfar).
+
+Training data for AI
+- Real turbulent footage has no clean ground truth.
+- Options: paired recordings (same static scene, calm vs hot air), synthetic turbulence applied to clean frames with a physics-based simulator, or self-supervised training on temporal consistency.
+- Realistic plan: synthetic pairs for training, paired recordings for validation.
+
+To clarify
+- Typical distance to target and conditions (roads, summer heat)?
+- Mostly static scene, or moving targets that must stay sharp?
+- Is a slower (about 1 fps) enhanced output acceptable next to the 50 fps live view?
+- Answered: no look-ahead (50 ms target); temporal methods may use past frames only.
+- Sample footage with turbulence, ideally with and without moving objects.
+
+Accept
+- Classical causal temporal fusion (past frames only) with a motion mask: fused background, raw pixels for moving regions.
+- A slower enhanced output (about 1 fps) on the NPU if the client accepts it.
+- Profile Turb-Seg-Res or a reduced version on the NPU only after classical is measured.
+
+Reject
+- Claiming that no classical method exists.
+- Running Turb-Seg-Res at full size at 50 fps on 2.3 TOPS.
+
+
+2. STABILIZATION
+Classical keypoint-based stabilization is the default: the per-pixel steps run on the GPU through OpenVX, the rest on the CPU, provided our footage has enough texture.
+
+What we have
+- No gimbal at this moment; we remove mount vibration. A gimbal may be added later.
+- Node list taken from the NVIDIA VisionWorks video stabilizer sample.
+- Idea to check keypoint density on the provided images before choosing classical vs AI.
+- AI reference list: awesome-video-stabilization.
+
+Where each node runs
+- convert_to_gray, copy: standard OpenVX, GPU.
+- pyramid: standard OpenVX, GPU.
+- optical flow (pyramidal LK): standard OpenVX, GPU.
+- feature_track (Harris / FAST): standard OpenVX, GPU.
+- warp_perspective: standard OpenVX, GPU.
+- find_homography: VisionWorks extension, not standard; CPU (OpenCV RANSAC).
+- homography_filter, matrix_smoother, truncate_stab_transform: VisionWorks extensions, not standard; CPU (small 3x3 matrix math).
+
+To clarify
+- Answered: no gimbal at this moment, so we remove mount vibration; a gimbal may be added later.
+- Answered: no look-ahead frames allowed (end-to-end under 50 ms).
+- Mount type (fixed mast or vehicle), vibration amplitude and frequency.
+- Does the camera move intentionally (manual pan, vehicle turns), and is a gimbal planned? The stabilizer must follow intended motion, not fight it.
+- Acceptable border loss from cropping after warp (typically 5 to 10%).
+- Typical scenes: is there low-texture content (sky, sea, haze) where keypoints disappear?
+
+Accept
+- Classical pipeline at 640x512, before turbulence fusion (fusion needs aligned frames).
+- Causal smoothing (Kalman or exponential) for zero added latency; tuned to remove vibration while following intended camera motion, including a gimbal if one is added later.
+- Measure per-frame feature count and RANSAC inlier ratio on real footage before committing.
+- Fallback for low texture: phase correlation (translation only), no keypoints needed.
+
+Reject
+- Running stabilization on the VPU.
+- The VisionWorks centered smoothing window as-is: it uses future frames, which the 50 ms target rules out.
+- AI stabilization models at 50 fps on this hardware, unless classical fails on the data.
+
+
+3. LENS FOCUS (NO NET)
+There is no target in front of the camera, so focus is found from the scene itself: drive the focus motor, measure image sharpness, and take the motor position where sharpness peaks. This is classical contrast-detection autofocus; no AI needed.
+
+What we have
+- No net or target in front of the camera: the algorithm must work on the live scene.
+- Goal: find the best-focus motor position (the peak of the focus curve) for the current zoom.
+- Decision: a visible refocus is acceptable (refocus, then continue).
+- Zoom is expected to be stepped; to be confirmed.
+
+Algorithm
+1. Start point: zoom-to-focus table from a factory sweep, so the search starts near the answer.
+2. Sharpness metric: Tenengrad (Sobel gradient energy) or variance of Laplacian, normalized by image intensity so brightness changes do not move the peak. Computed in a central ROI, or several zones with the strongest one used.
+3. Freeze AGC during the search: AGC changes contrast and would distort the curve.
+4. Average out turbulence and noise: take the metric over several frames, or on the turbulence-fused frames, at each motor position.
+5. Coarse-to-fine search: coarse steps across the range, then fine steps around the best point; golden-section search reduces the number of steps.
+6. Sub-step peak: fit a parabola (or Gaussian) to the 3 to 5 best points and take its vertex.
+7. Backlash: always approach the final position from the same direction.
+8. Confidence check: if the curve is flat (low-contrast scene, fog, uniform sky), keep the table value instead of a noisy peak.
+9. Triggers: zoom change, sustained sharpness drop, operator request.
+
+To clarify
+- By "focal center" do we mean the best-focus motor position (above)? If the optical center (principal point) is meant, that is a separate geometric calibration.
+- Lens control interface: motor steps, range, speed, backlash, position feedback?
+- How many zoom positions; stepped or continuous?
+- How long may a refocus take (seconds)?
+- Do the cameras stay stable over time, or is periodic recalibration needed?
+
+Accept
+- Contrast-detection autofocus as above, with the factory zoom-to-focus table as the starting point.
+- Sharpness measured on several frames (or fused frames) per position, with AGC frozen.
+- Parabola fit for a sub-step peak and a confidence check before moving the motor.
+
+Reject
+- AI-based focus estimation: unnecessary for this problem.
+- A single-frame sharpness measurement: turbulence and noise make it unreliable.
+- One shared calibration table for all units without verifying lens tolerance spread.
+
+
+4. HDR AND AUTO GAIN CONTROL
+With raw ADC input, this is our own algorithm work: mapping the high-bit-depth linear image to an 8-bit display image while keeping detail in both bright and dark areas.
+
+What we have
+- Raw ADC input; the i.MX ISP is likely unused, so the ISP's HDR and AE/AGC do not apply.
+- HDR / automatic luminance: need to see the data.
+- Gain auto control: no details yet.
+- CLAHE demo (clahe_demo.py) for exploring local contrast enhancement.
+
+To clarify
+- Sensor type and bit depth (decides the mapping method).
+- Does the sensor have its own gain or integration-time control we must drive?
+- Which scenes are hardest: bright sky over a dark target, hot objects, night, backlight?
+- Is there a region of interest the output must favour (center, tracked target)?
+- Day/night operation?
+
+Accept
+- Baseline: histogram-based mapping (plateau equalization) from 16-bit linear to 8-bit, with temporal smoothing so brightness does not flicker.
+- Local detail enhancement (CLAHE-style or base/detail split) on the GPU if global mapping loses detail.
+- ROI-weighted mapping if a target region matters.
+- AGC runs last in the pipeline, after stabilization and turbulence fusion.
+
+Reject
+- Converting to 8-bit before turbulence fusion and focus.
+- Multi-frame software HDR at 50 fps: it doubles the sensor rate and adds ghosting on motion.
+
+
+CROSS-CUTTING: LATENCY, ORDER, SHARED RESOURCES
+At 50 fps each stage has 20 ms per frame; the under-50 ms end-to-end target leaves about 2.5 frames, so look-ahead is ruled out and every stage must be pipelined.
+
+Pipeline order
+Raw ADC (640x512) -> unpack / NUC / bad pixels -> stabilize -> turbulence fusion -> AGC/HDR -> x2 zoom (1280x1024) -> display / VPU encode
+Focus metric taken from the fused frames -> focus motor.
+
+Watch out for
+- Look-ahead is ruled out: each future frame costs 20 ms of the 50 ms budget.
+- The GPU is the most contested resource: correction, stabilization, warp, turbulence fusion, AGC and zoom all run there.
+- The NPU is free for an AI turbulence model now that super-resolution is deprioritized.
+
+To clarify
+- Answered: under 50 ms end-to-end.
+- Which features run at the same time, and which are operator modes?
+- Power and thermal limits: fanless enclosure, ambient temperature?
+
+Accept
+- Pipelined stages with zero-copy buffers between them.
+- A per-stage latency budget built from measurements on the board, against the 50 ms target.
+
+Reject
+- Committing to "all features on, 50 fps, minimal latency" before profiling the combination.
+
+
+DATA TO REQUEST AND NEXT STEPS
+The blockers are the sensor details and real raw data; everything else can be scoped once those arrive.
+
+Data to request
+- Raw ADC frames at full bit depth (not AGC'd 8-bit or compressed video), 640x512, at least a few minutes per scenario.
+- Per-frame metadata: timestamp, frame counter, focus motor position, zoom step, sensor temperature.
+- Scenarios: normal day, low texture (sky/haze), strong vibration, hot-air turbulence (weak and strong), high-contrast, night.
+- Footage with and without moving targets.
+- Paired turbulence recordings: same static scene in calm air and in hot air.
+- Focus sweeps: frames across the full focus motor range at several zoom steps, motor position logged per frame.
+- Manufacturer's doc: raw format, NUC and bad-pixel procedure and data, lens and focus motor protocol.
+- BSP details (Linux image, OpenVX and NPU delegate availability).
+
+Next steps after the meeting
+1. Review the manufacturer's doc and implement the raw ADC to image stage.
+2. Prototype causal classical turbulence fusion with motion mask on the turbulence clips.
+3. Run keypoint statistics on the footage (feature count, inlier ratio) to confirm classical stabilization.
+4. Prototype contrast autofocus on the focus sweeps.
+5. Build a baseline AGC mapping on high-contrast clips.
+6. Build an end-to-end latency budget from measured numbers against the 50 ms target.
+
+
+DEPRIORITIZED
+Agreed on 25 Oct 2026 to drop these from the current scope; revisit only if the client raises them again.
+- Super-resolution: output is 640x512 with a x2 zoom to 1280x1024, so a classical upscale (Lanczos plus mild sharpening) is enough.
+- Automatic quality measurement: factory-only test, not needed now.
+- Multispectral detection and classification: out of scope for this phase.

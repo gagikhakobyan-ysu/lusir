@@ -1,0 +1,360 @@
+ i.MX8 Video Pipeline — Discussion Prep
+
+Ինչպես օգտագործել այս փաստաթուղթը
+Այստեղ որոշումների մեծ մասը հնարավոր չէ կայացնել, քանի դեռ չգիտենք i.MX8-ի ճշգրիտ տարբերակը (variant) և չենք տեսել իրական footage։ Առաջին հանդիպման խնդիրն է ստանալ այս երկու պատասխանները։ Ստորև յուրաքանչյուր թեմա ունի նույն չորս մասերը։
+Ինչ ունենք՝ արդեն քննարկված պահանջներ (requirements) և ենթադրություններ։
+Պարզաբանել՝ հարցեր hardware թիմին։
+Ընդունել՝ մոտեցումներ, որոնց կարող ենք պարտավորվել հիմա կամ նշված պայմանը կատարվելուց հետո։
+Status after Q&A
+Four answers are settled; the SoC variant is still the biggest unknown.
+Settled
+Question
+Answer
+Consequence
+End-to-end latency
+Under 50 ms
+About 2.5 frames at 50 fps. No future-frame smoothing; turbulence fusion uses past frames only; all stages pipelined with zero-copy buffers.
+Camera mounting
+Pan-tilt gimbal; its own stabilization is not enough
+Remove residual jitter only; the stabilizer must follow the intended pan/tilt, not fight it.
+Focus net
+Rendered on the camera optics
+Scene-independent target, always in view; sharpness metric can run continuously on it.
+Quality measurement
+Factory test only
+Standalone test tool; no runtime budget needed on the device.
+
+Still open, by impact
+☐ SoC variant: decides whether any AI is possible.
+☐ Output resolution: HD, FHD, or both.
+☐ 4:3 to 16:9 handling: crop, pillarbox, or stretch.
+☐ Video path: raw MIPI to i.MX ISP, or sensor module with its own ISP (decides who owns HDR and AE/AGC).
+☐ Gimbal IMU / angle data per frame: if synced, it can replace or assist keypoint tracking.
+☐ Footage availability: blocks keypoint, turbulence and SR evaluation.
+☐ Intentional pan / zoom during operation, and how often.
+☐ Scene content: moving targets, static, low texture.
+☐ Which features run concurrently vs as operator modes.
+☐ Net in the output video: keep, remove, or calibration mode only.
+☐ Power and thermal limits.
+Platform
+The exact i.MX8 variant decides whether AI is possible at all: only the i.MX 8M Plus has an NPU (2.3 TOPS).
+What we have
+Target: "IMX8", variant not confirmed.
+2.3 TOPS budget mentioned, which matches the i.MX 8M Plus.
+Assumption in the notes that the VPU can run keypoint extraction and matching. It cannot (see below).
+What each block can do (i.MX 8M Plus)
+Block
+Does
+Cannot do
+VPU (Video Processing Unit)
+H.264/H.265/VP8/VP9 decode, H.264/H.265 encode
+Any vision processing: keypoints, optical flow, warp
+GPU (Vivante GC7000UL)
+OpenVX, OpenCL, OpenGL ES: pyramids, optical flow, corners, warp
+Large neural networks efficiently
+NPU (2.3 TOPS)
+int8 neural networks via TFLite / VX delegate
+Classical CV; some ops fall back to CPU
+ISP (dual)
+Demosaic, HDR merge, AE/AGC, denoise
+Custom algorithms
+CPU (4x Cortex-A53)
+Control logic, homography, small matrix math
+Per-pixel work at 50 fps
+
+To clarify
+☐ Exact SoC: 8M Plus, 8M Mini/Nano (no NPU, weaker GPU), 8QM/QXP (no NPU), or the newer i.MX 95?
+☐ Is the board already chosen, or can we request the 8M Plus?
+☐ Sensor model and interface (MIPI CSI-2?), native resolution and max frame rate.
+☐ Does the camera feed go through the i.MX ISP, or does the sensor module have its own ISP?
+☐ Output path: HDMI display, encoded stream (VPU), or both?
+☐ BSP / Linux version and whether OpenVX and the NPU delegate are in the image.
+Accept
+VPU used only for final encoding of the HD/FHD output.
+GPU (OpenVX/OpenCL) for per-pixel classical CV.
+NPU for AI models, but only if the SoC is the 8M Plus.
+Reject
+Running keypoints, matching or stabilization on the VPU: the hardware does not support it.
+Any AI component at 50 fps if the SoC has no NPU.
+Super-resolution (640x480 to HD/FHD, 50 fps)
+A light int8 model (ESPCN or FSRCNN) fits the 8M Plus NPU on paper at roughly 0.3 to 0.45 TOPS, but it must beat a near-free classical upscaler on our footage to be worth it.
+What we have
+Input 640x480, output HD or FHD, 50 fps, end-to-end latency under 50 ms.
+Candidate models: FSRCNN, ESPCN (sub-pixel CNN). Heavy models (ESRGAN, diffusion) already ruled out.
+Plan to quantize to int8.
+To clarify
+☐ Output: 1280x720 or 1920x1080?
+☐ Aspect ratio: input is 4:3, output is 16:9. Crop top/bottom (640x360, then x2 or x3), pillarbox, or stretch?
+☐ Is SR a hard requirement, or is "looks sharp on an HD display" enough? This decides whether classical upscaling is acceptable.
+☐ Content type (people, vehicles, text, landscape) for choosing training data.
+☐ Is a quality metric agreed (PSNR, SSIM, or visual review)?
+Accept
+Classical baseline first: bicubic or Lanczos plus edge-aware sharpening on the GPU.
+ESPCN or FSRCNN at int8, on the Y channel only, chroma upscaled bicubically (about 3x less work).
+Integer scale factor (x2 or x3) after cropping to 16:9.
+Go/no-go based on measured NPU latency and quality versus the classical baseline.
+Reject
+ESRGAN, Real-ESRGAN, SwinIR, diffusion SR: far beyond the 2.3 TOPS budget at 50 fps.
+Non-integer, anisotropic scaling (x3 by x2.25) through an SR network.
+Deconvolution layers if the NPU delegate falls back to CPU; switch to pixel-shuffle instead.
+Committing to AI SR before profiling on the target board.
+Stabilization
+Classical keypoint-based stabilization is the default: the per-pixel steps run on the GPU through OpenVX, the rest on the CPU, provided our footage has enough texture.
+What we have
+Camera on a pan-tilt gimbal; its own stabilization is not enough, so we remove the residual jitter.
+Node list taken from the NVIDIA VisionWorks video stabilizer sample.
+Idea to check keypoint density on the provided images before choosing classical vs AI.
+AI reference list: awesome-video-stabilization.
+Where each node runs
+Node
+Standard OpenVX?
+Runs on
+convert_to_gray, copy
+Yes
+GPU
+pyramid
+Yes
+GPU
+optical flow (pyramidal LK)
+Yes
+GPU
+feature_track (Harris / FAST)
+Yes
+GPU
+warp_perspective
+Yes
+GPU
+find_homography
+No (VisionWorks extension)
+CPU, OpenCV RANSAC
+homography_filter, matrix_smoother, truncate_stab_transform
+No (VisionWorks extensions)
+CPU, small 3x3 matrix math
+
+To clarify
+☑ Answered: pan-tilt gimbal; remove only the residual jitter its own stabilization leaves.
+☐ How often does the gimbal intentionally pan, tilt or zoom? The stabilizer must follow it, not fight it.
+☐ Is gimbal IMU / angle data available per frame, synced to video? It can replace or assist keypoint tracking.
+☐ Acceptable border loss from cropping after warp (typical 5 to 10%).
+☐ Typical scenes: is there low-texture content (sky, sea, haze) where keypoints disappear?
+☑ Answered: no look-ahead frames allowed (end-to-end under 50 ms).
+IMX8 boards support vision processing units, but is it wrapped with Khronos api? // partially important - this is technical question
+Accept
+Classical pipeline at 640x480, before super-resolution.
+Causal smoothing (Kalman or exponential) for zero added latency, as the 50 ms target requires; tuned to remove jitter while following intended gimbal pan/tilt.
+Measure per-frame feature count and RANSAC inlier ratio on real footage before committing.
+Fallback for low texture: phase correlation (translation only), no keypoints needed.
+Reject
+Running stabilization on the VPU.
+The VisionWorks centered smoothing window as-is: it uses future frames, which the 50 ms target rules out.
+AI stabilization models at 50 fps on this hardware, unless classical fails on the data.
+Stabilizing after SR: 4 to 9x more pixels for no benefit.
+Hot-air distortion (atmospheric turbulence)
+This is the highest-risk item: classical methods exist and are cheap for static scenes, but moving objects and the 50 ms latency target make it hard on either path.
+What we have
+Assumption that only AI can solve it. That is not quite right: classical methods exist.
+Reference model: Turb-Seg-Res (segment moving objects, then restore). Likely too heavy; needs profiling. - model is toooo heavy even with NVIDA 3070 laptop gpu - other gpus should be checked, everything depends on the input data 
+No look-ahead allowed: any temporal method may use past frames only - no forward buffers, no latency lock
+Known classical approaches
+Register frames with dense optical flow, then temporal mean or median. Cheap, works well on static scenes - check if static when static scenes are used - may be stop pan/tilt and focus on the scene?
+Lucky imaging / lucky region fusion: keep the sharpest regions across a window of past frames.
+Non-rigid registration followed by blind deconvolution (Zhu and Milanfar).
+To clarify
+☐ Typical distance to target and conditions (desert, roads, summer heat)?
+☐ Mostly static scene, or moving targets that must stay sharp?
+☐ Must it run at 50 fps always, or only when switched on by the operator? - TODO: this is stupid question
+☑ Answered: no look-ahead (50 ms target); temporal methods may use past frames only.
+☐ Sample footage with turbulence, ideally with and without moving objects.
+Accept
+Classical causal temporal fusion (past frames only) with a motion mask: fused background, raw pixels for moving regions.
+Turbulence correction as a switchable mode if it cannot fit the always-on budget. - CAN PROVIDE 1 frame per sec (if not more slow)
+Profile Turb-Seg-Res or a reduced version on the NPU only after classical is measured.
+Reject
+Claiming that no classical method exists.
+Running Turb-Seg-Res at full size at 50 fps on 2.3 TOPS.
+Sharing the NPU with SR without a measured budget for both.
+Lens focus using the net
+This is a classical problem: a factory zoom-to-focus table plus an online sharpness hill-climb on the net crossing points; no AI needed.
+What we have
+The net is rendered on the camera optics: scene-independent and always in view.
+Factory calibration per zoom position, possibly per camera.
+Periodic recalibration using detected net cross points. - need to understand if cameras are stable over time, otherwise need to decide the calibration periodicity
+Output: focus motor position.
+To clarify
+☑ Answered: the net is rendered on the camera optics, so it is scene-independent.
+☑ Answered: always in view, as part of the optics.
+☐ Should the net be visible in the output video: keep, remove, or calibration mode only?
+☐ Lens control interface: motor steps, range, speed, backlash, any position feedback?
+☐ How many zoom positions, and is zoom continuous or stepped? --- should be stepped, but initially lets discuss
+☐ Temperature range: focus drifts with temperature, so do we need a temperature input? - this secondary question - we don't need this info
+☐ Can the image visibly hunt during refocus, or must refocus be invisible? - better to refocus and continue
+Accept
+Classical methods to be considered when data will be available
+https://medium.com/@ayselrajabli/how-can-you-tell-whether-this-image-is-blurry-ce152ef11ed8
+
+Sharpness metric: Tenengrad or variance of Laplacian, in an ROI around the net crossing points.
+Factory sweep per zoom step to build a zoom-to-focus table, per camera unit.
+Online small hill-climb around the table value; since the net is always in view, sharpness is monitored continuously and refocus retriggers on a sharpness drop or temperature change.
+Reject
+AI-based focus estimation: unnecessary for this problem.
+One shared calibration table for all units without verifying lens tolerance spread.
+HDR and auto gain control
+These are likely ISP and sensor tuning work rather than new algorithms; check what the sensor and ISP already provide before writing code.
+What we have
+HDR / automatic luminance: need to see the data.
+Gain auto control: no details yet.
+To clarify
+☐ Does the sensor support HDR (DOL, staggered, dual conversion gain)?
+☐ Is the image going through the i.MX ISP, a sensor-side ISP, or raw to our code?
+☐ Which scenes fail today: bright sky over a dark target, headlights at night, backlight?
+☐ Is there a region of interest the exposure must favour (center, tracked target)?
+☐ Day/night operation, IR cut filter?
+Accept
+Use sensor HDR plus ISP merge and AE/AGC first, then tune.
+ROI-weighted metering on top of the ISP AE if a target region matters.
+Software local tone mapping on the GPU only if ISP output is not enough.
+Reject
+Writing custom HDR merge or AE from scratch before testing the ISP.
+Multi-frame software HDR at 50 fps: it doubles the sensor rate and adds ghosting on motion.
+Automatic quality measurement
+
+https://www.dpnow.com/articles/1263.html
+
+This is a factory test only, so it runs as a standalone tool with no runtime budget on the device; a slanted-edge MTF target (ISO 12233) gives a standard, robust sharpness number alongside the bar-code FFT idea.
+What we have
+Factory test only (settled).
+Black and white bar-code targets in view.
+Row-wise FFT compared against a clean (golden) frame.
+Correlation between golden and camera outputs.
+To clarify
+☑ Answered: factory test only; a standalone test tool with no runtime budget on the device.
+☐ Is the target always in view, at a fixed position and distance?
+☐ What pass/fail thresholds does the factory test use?
+☐ Is the golden frame per camera, per zoom step, or one reference image?
+Accept
+Slanted-edge MTF (target tilted about 5 degrees); track MTF50 as the single sharpness number.
+Row FFT on bar codes as a cheap secondary check.
+SSIM or normalized cross-correlation against the golden frame to catch gross failures (blockage, misalignment).
+Reuse the same sharpness metric in the factory focus sweep above.
+Reject
+AI-based quality assessment: unnecessary and harder to explain to the customer.
+Golden-frame comparison alone: sensitive to lighting changes and small shifts.
+Multispectral detection and classification of moving objects
+Detect and classify objects such as tanks and machinery using complementary spectral imagery. The main challenges are combining information from different sensors and maintaining consistent annotations across spectral channels and video frames.
+What we have
+Detection/classification of moving objects using multiple spectral channels.
+A need to evaluate fusion approaches.
+Annotation inconsistencies that require clarification and correction.
+To clarify
+Which spectral channels are available? Are recordings synchronized and spatially aligned, with overlapping fields of view?
+What classes and output are required: bounding boxes, class labels, or persistent object tracks? What are the frame-rate and latency requirements?
+What annotation inconsistencies exist: missing objects, conflicting classes, different bounding boxes, or mismatched identities across sensors?
+How should objects visible in only one spectral channel be labeled and evaluated?
+Accept
+Establish a separate baseline for each spectral channel before evaluating fusion.
+Compare combining sensor information before detection, within the model, or after independent detections.
+Define shared annotation rules, class definitions, and a reviewed evaluation set.
+Evaluate performance when one channel is unavailable or provides poor imagery.
+Reject
+Assuming recordings are aligned merely because they show the same scene.
+Copying annotations between channels without checking alignment and visibility.
+Treating uncertain or invisible objects as confirmed negative examples.
+Committing to a fusion architecture before inspecting sensor data and annotation quality.
+
+Cross-cutting: latency, order, shared resources
+At 50 fps each stage has 20 ms per frame; the under-50 ms end-to-end target leaves about 2.5 frames, so look-ahead is ruled out and every stage must be pipelined across ISP, GPU, NPU and VPU.
+Proposed pipeline order
+Sensor / ISP: demosaic, HDR, AE/AGC (ISP)
+Stabilization: gray, pyramid, optical flow, features (GPU)
+Homography, smoothing (CPU)
+Warp (GPU)
+Turbulence fusion, if enabled (GPU)
+Super-resolution, Y channel (NPU or GPU)
+Chroma upscale and merge (GPU)
+Encode / display (VPU / display controller)
+Stabilization runs before super-resolution because it is 4 to 9x cheaper at 640x480 and gives the SR model steady input.
+Watch out for
+Look-ahead is ruled out: each future frame costs 20 ms of the 50 ms budget, so no centered smoothing window and no future frames in turbulence fusion.
+The NPU is shared: SR and any AI turbulence model compete for 2.3 TOPS.
+The GPU is shared: stabilization, warp, chroma merge and classical turbulence fusion all run there.
+To clarify
+☑ Answered: under 50 ms end-to-end.
+☐ Which features run at the same time, and which are exclusive modes?
+☐ Power and thermal limits: fanless enclosure, ambient temperature?
+Accept
+Pipelined stages with zero-copy buffers between them.
+A per-stage latency budget built from measurements on the board, against the 50 ms target.
+Reject
+Committing to "all features on, 50 fps, minimal latency" before profiling the combination.
+Data to request and next steps
+The two blockers are the SoC variant and real footage; everything else can be scoped once those arrive.
+Data to request
+☐ Raw, uncompressed footage at 640x480, 50 fps, at least a few minutes per scenario.
+☐ Scenarios: normal day, low texture (sky/haze), strong vibration, hot-air turbulence, high-contrast/backlit, night.
+☐ Footage with and without moving targets.
+☐ Clips at several zoom positions, with the net and bar-code targets in view.
+☐ Gimbal IMU / angle log synced to the footage, if available.
+☐ Sensor datasheet and lens / focus motor specification.
+☐ Board schematic or BSP details (SoC, memory, Linux image).
+Next steps after the meeting
+Confirm SoC; if it is not the 8M Plus, re-scope all AI items.
+Run keypoint statistics on the footage (feature count, inlier ratio) to confirm classical stabilization.
+Benchmark classical upscaling vs int8 ESPCN/FSRCNN on the board: latency, NPU CPU-fallbacks, PSNR/SSIM.
+Prototype causal classical turbulence fusion with motion mask on the turbulence clips.
+Test ISP HDR and AE on high-contrast clips before planning any custom work.
+Build an end-to-end latency budget from measured numbers against the 50 ms target.
+
+
+###### TO BE DISCUSSED #################
+
+Գլխավոր արգելափակողներ. SoC-ի տարբերակը և իրական footage-ը։
+Պլատֆորմ
+SoC-ի ճշգրիտ տարբերակը ո՞րն է՝ i.MX 8M Plus, 8M Mini/Nano (առանց NPU, ավելի թույլ GPU), 8QM/QXP (առանց NPU), թե՞ նոր i.MX 95։ Սա որոշում է՝ AI-ն ընդհանրապես հնարավո՞ր է։
+Board-ն արդեն ընտրվա՞ծ է, թե՞ կարող ենք պահանջել 8M Plus։
+Սենսորի մոդելը և ինտերֆեյսը (MIPI CSI-2՞), native լուծաչափը և առավելագույն frame rate-ը։
+Video path. raw MIPI-ն գնում է i.MX ISP, թե՞ սենսորի մոդուլն ունի սեփական ISP (որոշում է՝ ով է պատասխանատու HDR-ի և AGC-ի համար)։
+Ելքային ուղին. HDMI էկրա՞ն, encoded stream (VPU), թե՞ ինչ։
+BSP / Linux-ի տարբերակը, և OpenVX-ը ու NPU delegate-ը ներառվա՞ծ են image-ում։
+i.MX8-ի vision processing բլոկները wrap արվա՞ծ են Khronos API-ով (OpenVX)։ // միգուցե չհարցնել, սա մոդելից և հնարավոր ՕՍ-երից է կախված։
+Super-resolution
+ 8. Ելքային լուծաչափը՝ 1280x720, 1920x1080, թե՞ երկուսը։
+ 9. 4:3 → 16:9. crop վերևից/ներքևից (640x360, հետո x2 կամ x3), pillarbox, թե՞ stretch։
+ 10. SR-ը խիստ պահանջ է, թե՞ բավարար է «HD էկրանին սուր տեսքը»։ Սա որոշում է՝ դասական upscaling-ն ընդունելի՞ է։ // դասական upscaling-ը քիչ է, բայց հարցնել
+ 11. Բովանդակության տեսակը (մարդիկ, տրանսպորտ, տեքստ, լանդշաֆտ)՝ training data ընտրելու համար։
+ 12. Որակի մետրիկան համաձայնեցվա՞ծ է (PSNR, SSIM, թե՞ վիզուալ գնահատում)։ // սա շատ նախնական է, միգուցե չհարցնել
+Ստաբիլիզացիա
+ 13. Որքա՞ն հաճախ է gimbal-ը միտումնավոր pan/tilt/zoom անում։ Ստաբիլիզատորը պետք է հետևի դրան - gimbal-ից տվյալներ են պետք։
+ 14. Gimbal IMU / անկյան տվյալները հասանելի՞ են յուրաքանչյուր կադրի համար՝ վիդեոյի հետ սինքրոնացված։ Կարող են փոխարինել կամ օգնել keypoint tracking-ին։
+ 15. Warp-ից հետո crop-ի հետևանքով եզրերի ի՞նչ կորուստ է ընդունելի (սովորաբար 5–10%)։
+ 16. Կա՞ ցածր texture-ով տեսարաններ (երկինք, մշուշ, երեկո), որտեղ keypoint-երն անհետանում են։
+Տաք օդի աղավաղում (turbulence)
+ 17. Թիրախի տիպիկ հեռավորությունը և պայմանները (ճանապարհներ, ամառային շոգ)։
+ 18. Տեսարանը հիմնականում ստատի՞կ է, թե՞ կան շարժվող թիրախներ, որոնք պետք է սուր մնան։ // երևի չհարցնել
+ 19. Ստատիկ տեսարանների դեպքում հնարավո՞ր է կանգնեցնել pan/tilt-ը և կենտրոնանալ տեսարանի վրա։ // սա շատ կօգնի
+ 20. Turbulence-ով sample footage, ցանկալի է՝ շարժվող օբյեկտներով և առանց։
+ 21. Turb-Seg-Res-ը ծանր է նույնիսկ NVIDIA 3070 laptop GPU-ի համար. ո՞ր այլ GPU-ների վրա ստուգել։
+Լինզայի ֆոկուս (ցանցով)
+ 22. Ցանցը պե՞տք է երևա ելքային վիդեոյում՝ թողնել, հեռացնել, թե՞ միայն calibration ռեժիմում։
+ 23. Լինզայի կառավարման ինտերֆեյսը. motor steps, միջակայք, արագություն, backlash, դիրքի feedback կա՞։
+ 24. Քանի՞ zoom դիրք կա, zoom-ն անընդհա՞տ է, թե՞ քայլային (ենթադրաբար քայլային, բայց քննարկել)։
+ 25. Տեսախցիկները ժամանակի ընթացքում կայո՞ւն են, թե՞ պետք է որոշել վերակալիբրացիայի պարբերականությունը։ // մեծ հաշվոց շատ բան չի փոխվում
+HDR և AGC
+ 26. Սենսորն աջակցո՞ւմ է HDR (DOL, staggered, dual conversion gain)։
+ 27. Պատկերն անցնում է i.MX  ISP-ո՞վ, սենսորի ISP-ո՞վ, թե՞ raw-ով է գալիս մեր կոդին։ // լավ կլինի ցույց տան
+ 28. Ո՞ր տեսարաններում է այսօր խնդիր լինում՝ պայծառ երկինք մուգ թիրախի վրա, գիշերային լուսարձակներ, backlight։
+ 29. Կա՞ ROI, որը exposure-ը պետք է նախընտրի (կենտրոն, tracked թիրախ)։
+ 30. Ցերեկ/գիշեր աշխատա՞նք, IR cut filter կա՞։ // պետք է որ լինի, բայց տեսնենք
+Որակի ավտոմատ չափում
+ 31. Թիրախը միշտ տեսադաշտո՞ւմ է՝ ֆիքսված դիրքում և հեռավորության վրա։
+ 32. Գործարանային թեստն ի՞նչ pass/fail շեմեր է օգտագործում։
+ 33. Golden frame-ը յուրաքանչյուր տեսախցիկի՞ համար է, յուրաքանչյուր zoom քայլի՞, թե՞ մեկ ընդհանուր reference պատկեր է։
+Multispectral հայտնաբերում և դասակարգում
+ 34. Ո՞ր spectral ալիքներն են հասանելի։ Ձայնագրությունները սինքրոնացվա՞ծ և տարածականորեն համահունչ են, տեսադաշտերը համընկնո՞ւմ են։
+ 35. Ի՞նչ դասեր և ելք է պետք՝ bounding box, class label, թե՞ կայուն object track։ Ի՞նչ պահանջներ կան frame rate-ի և latency-ի համար։
+ 36. Annotation-ներում ի՞նչ անհամապատասխանություններ կան՝ բաց թողնված օբյեկտներ, հակասող դասեր, տարբեր bounding box-ներ, սենսորների միջև չհամընկնող identity-ներ։
+ 37. Ինչպե՞ս label անել և գնահատել միայն մեկ ալիքում տեսանելի օբյեկտները։ // պետք է իմանալ, հնարավոր է միայն մեկ ալիքի տվյալներ հավաքագրել
+Ընդհանուր
+ 38. Ո՞ր ֆունկցիաներն են աշխատում միաժամանակ, և որո՞նք են առանձին operator ռեժիմներ։ // առաջարկել, որ բոլորը լինեն առանձին
+ 39. Սնուցման և ջերմային սահմանափակումներ՝ fanless enclosure, միջավայրի ջերմաստիճան։ // իհարկե մեզ շատ բան չի տա, բայց միգուցե այլ board առաջարկենք
+ 40. Ե՞րբ կլինի footage-ը։ Առանց դրա արգելափակված է keypoint-ի, turbulence-ի և SR-ի գնահատումը։
+
